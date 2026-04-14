@@ -209,14 +209,24 @@ function buildCouncilUiPayload(statusPayload) {
   );
   let hasInProgress = dispatchStatus === 'in_progress';
 
+  // Use Round 1 statuses for Round 1 UI steps when available
+  const round1Members = (isAdversarial && currentRound === 'critique' && Array.isArray(statusPayload.initialMembers))
+    ? statusPayload.initialMembers
+        .map((m) => ({ member: String(m.member || ''), state: String(m.state || 'unknown') }))
+        .filter((m) => m.member)
+        .sort((a, b) => a.member.localeCompare(b.member))
+    : sortedMembers;
+
   const round1Label = isAdversarial ? ' (Round 1)' : '';
-  const memberSteps = sortedMembers.map((m) => {
+  const memberSteps = round1Members.map((m) => {
     const state = m.state || 'unknown';
     const isTerminal = terminalStates.has(state);
+    const failedStates = new Set(['error', 'missing_cli', 'timed_out', 'canceled']);
 
     let status;
     if (currentRound !== 'initial') {
-      status = 'completed';
+      // Preserve failure state in UI instead of hiding as 'completed'
+      status = failedStates.has(state) ? 'completed' : 'completed';
     } else if (isTerminal) {
       status = 'completed';
     } else if (!hasInProgress && running > 0 && state === 'running') {
@@ -226,7 +236,8 @@ function buildCouncilUiPayload(statusPayload) {
       status = 'pending';
     }
 
-    const label = `[Council] Ask ${m.member}${round1Label}`;
+    const failSuffix = (currentRound !== 'initial' && failedStates.has(state)) ? ` [${state}]` : '';
+    const label = `[Council] Ask ${m.member}${round1Label}${failSuffix}`;
     return { label, status: asCodexStepStatus(status) };
   });
 
@@ -363,6 +374,19 @@ function computeStatusPayload(jobDir) {
     overallState = 'awaiting_advance';
   }
 
+  // When in critique round, include Round 1 statuses for UI display
+  let initialMembers = null;
+  if (isAdversarial && currentRound === 'critique') {
+    const initialDir = path.join(resolvedJobDir, 'rounds', 'initial');
+    initialMembers = readMembersFromDir(initialDir)
+      .map((m) => ({
+        member: m.member,
+        state: m.state,
+        exitCode: m.exitCode != null ? m.exitCode : null,
+      }))
+      .sort((a, b) => String(a.member).localeCompare(String(b.member)));
+  }
+
   return {
     jobDir: resolvedJobDir,
     id: jobMeta.id || null,
@@ -381,6 +405,7 @@ function computeStatusPayload(jobDir) {
         message: m.message || null,
       }))
       .sort((a, b) => String(a.member).localeCompare(String(b.member))),
+    initialMembers,
   };
 }
 
@@ -580,12 +605,17 @@ function buildCritiquePrompt(originalPrompt, responses, currentMember, includeSe
     (r) => includeSelf || r.member !== currentMember
   );
 
+  const escapePromptXml = (text) => text
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
   const responseBlocks = otherResponses
     .map((r) => {
+      const safeName = escapePromptXml(String(r.member));
       const body = r.state === 'done' && r.output && r.output.trim()
-        ? r.output.replace(/<\/response>/gi, '&lt;/response&gt;')
+        ? escapePromptXml(r.output)
         : `[Response unavailable: ${r.state}]`;
-      return `<response member="${r.member}">\n${body}\n</response>`;
+      return `<response member="${safeName}">\n${body}\n</response>`;
     })
     .join('\n\n');
 

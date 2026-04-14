@@ -177,11 +177,14 @@ function main() {
   if (child.stdout) child.stdout.pipe(outStream);
   if (child.stderr) child.stderr.pipe(errStream);
 
-  // Issue 7a: Forward SIGTERM to child so CLI processes don't orphan
+  // Forward SIGTERM/SIGINT to child; force-exit if child doesn't die
   const forwardSignal = () => {
     if (child && child.pid) {
       try { process.kill(child.pid, 'SIGTERM'); } catch { /* ignore */ }
     }
+    // Force exit after 5s if child ignores the signal
+    const forceExit = setTimeout(() => process.exit(130), 5000);
+    forceExit.unref();
   };
   process.on('SIGTERM', forwardSignal);
   process.on('SIGINT', forwardSignal);
