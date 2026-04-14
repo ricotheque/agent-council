@@ -180,7 +180,8 @@ function buildCouncilUiPayload(statusPayload) {
   const counts = statusPayload.counts || {};
   const done = computeTerminalDoneCount(counts);
   const total = Number(counts.total || 0);
-  const isDone = String(statusPayload.overallState || '') === 'done';
+  const overallStateStr = String(statusPayload.overallState || '');
+  const isDone = overallStateStr === 'done' || overallStateStr === 'awaiting_advance';
   const isAdversarial = statusPayload.adversarial === true;
   const currentRound = statusPayload.currentRound || 'initial';
 
@@ -198,7 +199,10 @@ function buildCouncilUiPayload(statusPayload) {
     .sort((a, b) => a.member.localeCompare(b.member));
 
   const terminalStates = new Set(['done', 'missing_cli', 'error', 'timed_out', 'canceled']);
-  const dispatchStatus = asCodexStepStatus(isDone ? 'completed' : queued > 0 ? 'in_progress' : 'completed');
+  // Issue 4: Force dispatch completed once past Round 1
+  const dispatchStatus = asCodexStepStatus(
+    (isDone || currentRound !== 'initial') ? 'completed' : (queued > 0 ? 'in_progress' : 'completed')
+  );
   let hasInProgress = dispatchStatus === 'in_progress';
 
   const round1Label = isAdversarial ? ' (Round 1)' : '';
@@ -341,7 +345,12 @@ function computeStatusPayload(jobDir) {
   }
 
   const allDone = totals.running === 0 && totals.queued === 0;
-  const overallState = allDone ? 'done' : totals.running > 0 ? 'running' : 'queued';
+  let overallState = allDone ? 'done' : totals.running > 0 ? 'running' : 'queued';
+
+  // Issue 3: Distinguish "round done" from "job done" in adversarial mode
+  if (allDone && isAdversarial && currentRound === 'initial') {
+    overallState = 'awaiting_advance';
+  }
 
   return {
     jobDir: resolvedJobDir,
@@ -558,10 +567,12 @@ function buildCritiquePrompt(originalPrompt, responses, currentMember, includeSe
   );
 
   const responseBlocks = otherResponses
-    .map(
-      (r) =>
-        `<response member="${r.member}">\n${r.output}\n</response>`
-    )
+    .map((r) => {
+      const body = r.state === 'done' && r.output && r.output.trim()
+        ? r.output.replace(/<\/response>/gi, '&lt;/response&gt;')
+        : `[Response unavailable: ${r.state}]`;
+      return `<response member="${r.member}">\n${body}\n</response>`;
+    })
     .join('\n\n');
 
   return `You are participating in Agent Council Round 2: adversarial review.
@@ -598,6 +609,12 @@ function cmdAdvance(options, jobDir) {
   if (!jobMeta.adversarial) exitWithError('advance: job is not in adversarial mode');
   if (jobMeta.currentRound !== 'initial') exitWithError(`advance: expected currentRound=initial, got ${jobMeta.currentRound}`);
 
+  // Issue 1: Verify Round 1 is complete before advancing
+  const round1Status = computeStatusPayload(resolvedJobDir);
+  if (round1Status.counts.running > 0 || round1Status.counts.queued > 0) {
+    exitWithError(`advance: Round 1 still in progress (${round1Status.counts.running} running, ${round1Status.counts.queued} queued)`);
+  }
+
   const initialDir = path.join(resolvedJobDir, 'rounds', 'initial');
   if (!fs.existsSync(initialDir)) exitWithError(`advance: initial round directory not found: ${initialDir}`);
 
@@ -605,6 +622,7 @@ function cmdAdvance(options, jobDir) {
     ? fs.readFileSync(path.join(resolvedJobDir, 'prompt.txt'), 'utf8')
     : '';
 
+  // Issue 5: Pass ALL responses (including failed) to critique prompt
   const responses = [];
   for (const entry of fs.readdirSync(initialDir)) {
     const statusPath = path.join(initialDir, entry, 'status.json');
@@ -615,8 +633,7 @@ function cmdAdvance(options, jobDir) {
     responses.push({ member: status.member, safeName: entry, state: status.state, output });
   }
 
-  const successfulResponses = responses.filter((r) => r.state === 'done' && r.output.trim());
-  if (successfulResponses.length === 0) exitWithError('advance: no successful Round 1 responses to critique');
+  if (responses.length === 0) exitWithError('advance: no Round 1 responses found');
 
   const critiqueDir = path.join(resolvedJobDir, 'rounds', 'critique');
   ensureDir(critiqueDir);
@@ -625,13 +642,16 @@ function cmdAdvance(options, jobDir) {
   const critiqueTimeout = jobMeta.settings.critiqueTimeout || jobMeta.settings.timeoutSec || 0;
   const members = jobMeta.members || [];
 
+  // Issue 2: Three-phase approach — prepare, flip state, then spawn
+  // Phase 1: Create all critique dirs, prompts, and queued status files
+  const workerConfigs = [];
   for (const member of members) {
     const name = String(member.name);
     const safeName = safeFileName(name);
     const memberDir = path.join(critiqueDir, safeName);
     ensureDir(memberDir);
 
-    const critiquePrompt = buildCritiquePrompt(originalPrompt, successfulResponses, name, includeSelf);
+    const critiquePrompt = buildCritiquePrompt(originalPrompt, responses, name, includeSelf);
     fs.writeFileSync(path.join(memberDir, 'prompt.txt'), critiquePrompt, 'utf8');
 
     atomicWriteJson(path.join(memberDir, 'status.json'), {
@@ -644,34 +664,33 @@ function cmdAdvance(options, jobDir) {
 
     const workerArgs = [
       WORKER_PATH,
-      '--job-dir',
-      resolvedJobDir,
-      '--member',
-      name,
-      '--safe-member',
-      safeName,
-      '--command',
-      String(member.command),
-      '--work-dir',
-      memberDir,
-      '--prompt-file',
-      path.join(memberDir, 'prompt.txt'),
+      '--job-dir', resolvedJobDir,
+      '--member', name,
+      '--safe-member', safeName,
+      '--command', String(member.command),
+      '--work-dir', memberDir,
+      '--prompt-file', path.join(memberDir, 'prompt.txt'),
     ];
     if (critiqueTimeout && Number.isFinite(critiqueTimeout) && critiqueTimeout > 0) {
       workerArgs.push('--timeout', String(critiqueTimeout));
     }
+    workerConfigs.push({ workerArgs });
+  }
 
-    const child = spawn(process.execPath, workerArgs, {
+  // Phase 2: Atomically flip currentRound
+  jobMeta.currentRound = 'critique';
+  jobMeta.advancedAt = new Date().toISOString();
+  atomicWriteJson(path.join(resolvedJobDir, 'job.json'), jobMeta);
+
+  // Phase 3: Spawn workers
+  for (const wc of workerConfigs) {
+    const child = spawn(process.execPath, wc.workerArgs, {
       detached: true,
       stdio: 'ignore',
       env: process.env,
     });
     child.unref();
   }
-
-  jobMeta.currentRound = 'critique';
-  jobMeta.advancedAt = new Date().toISOString();
-  atomicWriteJson(path.join(resolvedJobDir, 'job.json'), jobMeta);
 
   if (options.json) {
     process.stdout.write(`${JSON.stringify({ jobDir: resolvedJobDir, currentRound: 'critique', members: members.length }, null, 2)}\n`);

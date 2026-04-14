@@ -117,7 +117,7 @@ process.stdout.write(String(d.overallState||""));
 
     "$JOB_SCRIPT" status --text "$JOB_DIR" >&2
 
-    if [ "$OVERALL" = "done" ]; then
+    if [ "$OVERALL" = "done" ] || [ "$OVERALL" = "awaiting_advance" ]; then
       break
     fi
   done

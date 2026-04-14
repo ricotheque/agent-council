@@ -100,6 +100,21 @@ function main() {
   if (!safeMember) exitWithError('worker: missing --safe-member');
   if (!command) exitWithError('worker: missing --command');
 
+  // Issue 7b: Validate paths resolve under jobDir
+  const resolvedJobDir = path.resolve(jobDir);
+  if (workDir) {
+    const resolvedWorkDir = path.resolve(workDir);
+    if (!resolvedWorkDir.startsWith(resolvedJobDir + path.sep) && resolvedWorkDir !== resolvedJobDir) {
+      exitWithError(`worker: --work-dir must be under --job-dir`);
+    }
+  }
+  if (promptFile) {
+    const resolvedPromptFile = path.resolve(promptFile);
+    if (!resolvedPromptFile.startsWith(resolvedJobDir + path.sep) && resolvedPromptFile !== resolvedJobDir) {
+      exitWithError(`worker: --prompt-file must be under --job-dir`);
+    }
+  }
+
   const memberDir = workDir || path.join(path.join(jobDir, 'members'), safeMember);
   const statusPath = path.join(memberDir, 'status.json');
   const outPath = path.join(memberDir, 'output.txt');
@@ -161,6 +176,15 @@ function main() {
 
   if (child.stdout) child.stdout.pipe(outStream);
   if (child.stderr) child.stderr.pipe(errStream);
+
+  // Issue 7a: Forward SIGTERM to child so CLI processes don't orphan
+  const forwardSignal = () => {
+    if (child && child.pid) {
+      try { process.kill(child.pid, 'SIGTERM'); } catch { /* ignore */ }
+    }
+  };
+  process.on('SIGTERM', forwardSignal);
+  process.on('SIGINT', forwardSignal);
 
   let timeoutHandle = null;
   let timeoutTriggered = false;

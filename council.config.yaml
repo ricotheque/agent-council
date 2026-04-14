@@ -43,6 +43,6 @@ council:
     # synthesize: true       # Force Stage 3 synthesis inside council.sh (requires chairman.command or --chairman codex/gemini)
 
     # Adversarial review: after Round 1 responses, each agent critiques the others
-    adversarial_review: true
+    adversarial_review: false
     critique_timeout: 120   # Timeout for the critique round (defaults to timeout if omitted)
     critique_include_self: false  # Whether agents see their own Round 1 response in the critique
