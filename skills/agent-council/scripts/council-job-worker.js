@@ -159,7 +159,7 @@ function main() {
   const errStream = fs.createWriteStream(errPath, { flags: 'w' });
 
   const spawnOpts = {
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['pipe', 'pipe', 'pipe'],
     env: process.env,
   };
   // In code mode, run agent inside the worktree directory
@@ -169,7 +169,7 @@ function main() {
 
   let child;
   try {
-    child = spawn(program, [...args, prompt], spawnOpts);
+    child = spawn(program, args, spawnOpts);
   } catch (error) {
     atomicWriteJson(statusPath, {
       member,
@@ -188,6 +188,12 @@ function main() {
     command,
     pid: child.pid,
   });
+
+  // Pass prompt via stdin (avoids CLI argument size limits for large prompts)
+  if (child.stdin) {
+    child.stdin.write(prompt);
+    child.stdin.end();
+  }
 
   if (child.stdout) child.stdout.pipe(outStream);
   if (child.stderr) child.stderr.pipe(errStream);
@@ -250,6 +256,7 @@ function main() {
 
     // In code mode, collect diff from worktree against the pinned base commit
     let hasDiff = false;
+    let diffError = null;
     if (mode === 'code' && worktreeDir && (state === 'done' || state === 'error')) {
       try {
         const { execFileSync } = require('child_process');
@@ -257,12 +264,20 @@ function main() {
         execFileSync('git', ['add', '-A'], { cwd: worktreeDir, stdio: 'ignore' });
         // Diff against pinned base commit (not HEAD, which may have moved if agent committed)
         const diffRef = baseCommit || 'HEAD';
-        const diff = execFileSync('git', ['diff', '--cached', diffRef], { cwd: worktreeDir, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+        const diff = execFileSync('git', ['diff', '--cached', diffRef], {
+          cwd: worktreeDir,
+          encoding: 'utf8',
+          maxBuffer: 50 * 1024 * 1024,  // 50MB for large diffs
+        });
         const diffPath = path.join(memberDir, 'diff.patch');
         fs.writeFileSync(diffPath, diff, 'utf8');
         hasDiff = diff.trim().length > 0;
-      } catch {
-        // Diff collection failed — not fatal, agent output is still available
+      } catch (err) {
+        diffError = err && err.message ? err.message : 'Failed to collect diff';
+        // Write error to a file so results can distinguish "no diff" from "diff failed"
+        try {
+          fs.writeFileSync(path.join(memberDir, 'diff-error.txt'), diffError, 'utf8');
+        } catch { /* ignore */ }
       }
     }
 
@@ -277,6 +292,7 @@ function main() {
       pid: child.pid,
       mode,
       hasDiff,
+      diffError: diffError || null,
       worktreeDir: worktreeDir || null,
     });
     process.exit(code === 0 ? 0 : 1);

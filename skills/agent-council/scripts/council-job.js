@@ -593,13 +593,18 @@ function cmdStart(options, prompt) {
       cleanupWorktrees,
       keepWorktreesOnError,
     },
-    members: members.map((m) => ({
-      name: String(m.name),
-      command: String(mode === 'code' && m.code_command ? m.code_command : m.command),
-      reviewCommand: String(m.command),
-      emoji: m.emoji ? String(m.emoji) : null,
-      color: m.color ? String(m.color) : null,
-    })),
+    members: members.map((m) => {
+      if (mode === 'code' && !m.code_command) {
+        process.stderr.write(`warning: member '${m.name}' has no code_command — falling back to review command in code mode\n`);
+      }
+      return {
+        name: String(m.name),
+        command: String(mode === 'code' && m.code_command ? m.code_command : m.command),
+        reviewCommand: String(m.command),
+        emoji: m.emoji ? String(m.emoji) : null,
+        color: m.color ? String(m.color) : null,
+      };
+    }),
   };
   atomicWriteJson(path.join(jobDir, 'job.json'), jobMeta);
 
@@ -1198,6 +1203,7 @@ function cmdStop(_options, jobDir) {
 function cmdClean(_options, jobDir) {
   const resolvedJobDir = path.resolve(jobDir);
   const jobMeta = readJsonIfExists(path.join(resolvedJobDir, 'job.json'));
+  const keptWorktrees = [];
 
   // Clean up git worktrees before removing the job directory
   if (jobMeta && jobMeta.mode === 'code' && jobMeta.gitRoot) {
@@ -1208,17 +1214,27 @@ function cmdClean(_options, jobDir) {
     const worktreesDir = path.join(resolvedJobDir, 'worktrees');
     if (shouldCleanup && fs.existsSync(worktreesDir)) {
       for (const entry of fs.readdirSync(worktreesDir)) {
-        // If keepWorktreesOnError, check if this member errored
+        const wtPath = path.join(worktreesDir, entry);
+
+        // If keepWorktreesOnError, relocate errored worktrees outside jobDir
         if (keepOnError) {
           const initialDir = path.join(resolvedJobDir, 'rounds', 'initial', entry);
           const statusPath = path.join(initialDir, 'status.json');
           const status = readJsonIfExists(statusPath);
           if (status && status.state !== 'done') {
-            process.stderr.write(`clean: keeping worktree for errored member ${entry}: ${worktreesDir}/${entry}\n`);
+            // Move worktree to a sibling of jobDir so rmSync doesn't destroy it
+            const preservedPath = `${resolvedJobDir}-kept-${entry}`;
+            try {
+              fs.renameSync(wtPath, preservedPath);
+              keptWorktrees.push(preservedPath);
+              process.stderr.write(`clean: preserved errored worktree: ${preservedPath}\n`);
+            } catch {
+              process.stderr.write(`clean: failed to preserve worktree for ${entry}, removing\n`);
+              removeWorktree(jobMeta.gitRoot, wtPath);
+            }
             continue;
           }
         }
-        const wtPath = path.join(worktreesDir, entry);
         removeWorktree(jobMeta.gitRoot, wtPath);
       }
     }
@@ -1229,7 +1245,15 @@ function cmdClean(_options, jobDir) {
   }
 
   fs.rmSync(resolvedJobDir, { recursive: true, force: true });
-  process.stdout.write(`cleaned: ${resolvedJobDir}\n`);
+
+  if (keptWorktrees.length > 0) {
+    process.stdout.write(`cleaned: ${resolvedJobDir} (preserved ${keptWorktrees.length} worktree(s) for inspection)\n`);
+    for (const p of keptWorktrees) {
+      process.stdout.write(`  → ${p}\n`);
+    }
+  } else {
+    process.stdout.write(`cleaned: ${resolvedJobDir}\n`);
+  }
 }
 
 function main() {

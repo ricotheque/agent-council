@@ -7,7 +7,7 @@ council:
   # Council members configuration
   # Each member needs:
   #   - name: identifier for the agent
-  #   - command: CLI command to execute (prompt will be appended)
+  #   - command: CLI command to execute (prompt is passed via stdin)
   #   - emoji: display emoji (optional)
   #   - color: ANSI color (RED, GREEN, BLUE, YELLOW, CYAN)
 
@@ -25,8 +25,9 @@ council:
       color: "BLUE"
 
     - name: gemini
-      command: "gemini -p"
-      code_command: "gemini -p --yolo"
+      # Prompts are passed via stdin; -p with placeholder keeps headless mode
+      command: "gemini -p . -m gemini-2.5-flash"
+      code_command: "gemini -p . -m gemini-2.5-flash --yolo"
       emoji: "💎"
       color: "GREEN"
 
