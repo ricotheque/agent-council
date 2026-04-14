@@ -41,10 +41,8 @@ function normalizeBool(value) {
 function resolveAutoRole(role, hostRole, memberNames) {
   const roleLc = String(role || '').trim().toLowerCase();
   if (roleLc === 'random' && Array.isArray(memberNames) && memberNames.length > 0) {
-    const hostLc = String(hostRole || '').toLowerCase();
-    const candidates = hostLc ? [hostLc, ...memberNames.map(n => n.toLowerCase())] : memberNames.map(n => n.toLowerCase());
-    const unique = [...new Set(candidates)];
-    return unique[Math.floor(Math.random() * unique.length)];
+    const candidates = [...new Set(memberNames.map(n => String(n).toLowerCase()))];
+    return candidates[Math.floor(Math.random() * candidates.length)];
   }
   if (roleLc && roleLc !== 'auto') return roleLc;
   if (hostRole === 'codex') return 'codex';
@@ -234,14 +232,21 @@ function buildCouncilUiPayload(statusPayload) {
 
   const challengeSteps = [];
   if (isAdversarial) {
-    const advanceStatus = currentRound === 'initial'
-      ? 'pending'
-      : 'completed';
+    const advanceStatus = overallStateStr === 'awaiting_advance'
+      ? 'in_progress'
+      : currentRound === 'initial'
+        ? 'pending'
+        : 'completed';
 
     challengeSteps.push({
       label: '[Council] Adversarial review',
       status: asCodexStepStatus(advanceStatus),
-      activeForm: advanceStatus === 'completed' ? 'Dispatched critique prompts' : 'Waiting for Round 1',
+      activeForm:
+        advanceStatus === 'completed'
+          ? 'Dispatched critique prompts'
+          : advanceStatus === 'in_progress'
+            ? 'Round 1 complete — advancing'
+            : 'Waiting for Round 1',
     });
 
     for (const m of sortedMembers) {
