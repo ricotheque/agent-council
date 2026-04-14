@@ -28,7 +28,7 @@ Agent Council
 Default mode is job-based parallel execution (pollable).
 
 Usage:
-  $(basename "$0") start [options] "question"
+  $(basename "$0") start [--mode review|code] [options] "question"
   $(basename "$0") status [--json|--text|--checklist] <jobDir>
   $(basename "$0") wait [--cursor CURSOR] [--bucket auto|N] [--interval-ms N] [--timeout-ms N] <jobDir>
   $(basename "$0") results [--json] <jobDir>

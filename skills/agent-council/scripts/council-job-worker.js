@@ -94,6 +94,8 @@ function main() {
   const timeoutSec = options.timeout ? Number(options.timeout) : 0;
   const workDir = options['work-dir'];
   const promptFile = options['prompt-file'];
+  const mode = options.mode || 'review';
+  const worktreeDir = options['worktree-dir'];
 
   if (!jobDir) exitWithError('worker: missing --job-dir');
   if (!member) exitWithError('worker: missing --member');
@@ -149,12 +151,18 @@ function main() {
   const outStream = fs.createWriteStream(outPath, { flags: 'w' });
   const errStream = fs.createWriteStream(errPath, { flags: 'w' });
 
+  const spawnOpts = {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: process.env,
+  };
+  // In code mode, run agent inside the worktree directory
+  if (mode === 'code' && worktreeDir) {
+    spawnOpts.cwd = worktreeDir;
+  }
+
   let child;
   try {
-    child = spawn(program, [...args, prompt], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: process.env,
-    });
+    child = spawn(program, [...args, prompt], spawnOpts);
   } catch (error) {
     atomicWriteJson(statusPath, {
       member,
@@ -231,15 +239,36 @@ function main() {
     if (timeoutHandle) clearTimeout(timeoutHandle);
     const timedOut = Boolean(timeoutTriggered) && signal === 'SIGTERM';
     const canceled = !timedOut && signal === 'SIGTERM';
+    const state = timedOut ? 'timed_out' : canceled ? 'canceled' : code === 0 ? 'done' : 'error';
+
+    // In code mode, collect diff from worktree after agent finishes
+    let hasDiff = false;
+    if (mode === 'code' && worktreeDir && (state === 'done' || state === 'error')) {
+      try {
+        const { execSync } = require('child_process');
+        // Stage all changes including untracked files, then diff against HEAD
+        execSync('git add -A', { cwd: worktreeDir, stdio: 'ignore' });
+        const diff = execSync('git diff --cached HEAD', { cwd: worktreeDir, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+        const diffPath = path.join(memberDir, 'diff.patch');
+        fs.writeFileSync(diffPath, diff, 'utf8');
+        hasDiff = diff.trim().length > 0;
+      } catch {
+        // Diff collection failed — not fatal, agent output is still available
+      }
+    }
+
     finalize({
       member,
-      state: timedOut ? 'timed_out' : canceled ? 'canceled' : code === 0 ? 'done' : 'error',
+      state,
       message: timedOut ? `Timed out after ${timeoutSec}s` : canceled ? 'Canceled' : null,
       finishedAt: new Date().toISOString(),
       command,
       exitCode: typeof code === 'number' ? code : null,
       signal: signal || null,
       pid: child.pid,
+      mode,
+      hasDiff,
+      worktreeDir: worktreeDir || null,
     });
     process.exit(code === 0 ? 0 : 1);
   });

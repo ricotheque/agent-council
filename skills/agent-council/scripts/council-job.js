@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 
 const SCRIPT_DIR = __dirname;
 const SKILL_DIR = path.resolve(SCRIPT_DIR, '..');
@@ -460,7 +460,7 @@ function printHelp() {
   process.stdout.write(`Agent Council (job mode)
 
 Usage:
-  council-job.sh start [--config path] [--chairman auto|claude|codex|...] [--jobs-dir path] [--json] "question"
+  council-job.sh start [--mode review|code] [--config path] [--chairman auto|claude|codex|...] [--jobs-dir path] [--json] "question"
   council-job.sh status [--json|--text|--checklist] [--verbose] <jobDir>
   council-job.sh wait [--cursor CURSOR] [--bucket auto|N] [--interval-ms N] [--timeout-ms N] <jobDir>
   council-job.sh advance [--json] <jobDir>
@@ -474,6 +474,37 @@ Notes:
   - wait prints JSON by default and blocks until meaningful progress occurs, so you don't spam tool cells
   - advance transitions from Round 1 to the adversarial critique round (requires adversarial_review: true in config)
 `);
+}
+
+function findGitRoot(startDir) {
+  try {
+    return execSync('git rev-parse --show-toplevel', { cwd: startDir || process.cwd(), encoding: 'utf8' }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function createWorktree(gitRoot, worktreePath, branchName) {
+  ensureDir(path.dirname(worktreePath));
+  execSync(`git worktree add --detach "${worktreePath}"`, { cwd: gitRoot, stdio: 'ignore' });
+  return worktreePath;
+}
+
+function collectWorktreeDiff(worktreePath) {
+  try {
+    execSync('git add -A', { cwd: worktreePath, stdio: 'ignore' });
+    return execSync('git diff --cached HEAD', { cwd: worktreePath, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+  } catch {
+    return '';
+  }
+}
+
+function removeWorktree(gitRoot, worktreePath) {
+  try {
+    execSync(`git worktree remove --force "${worktreePath}"`, { cwd: gitRoot, stdio: 'ignore' });
+  } catch {
+    // Best-effort: may already be removed
+  }
 }
 
 function cmdStart(options, prompt) {
@@ -499,9 +530,15 @@ function cmdStart(options, prompt) {
   const excludeChairmanFromMembers =
     excludeChairmanOverride != null ? excludeChairmanOverride : excludeSetting != null ? excludeSetting : true;
 
-  const timeoutSetting = Number(config.council.settings.timeout || 0);
+  // Mode: review (text responses) or code (worktree implementations)
+  const modeSetting = String(config.council.settings.mode || 'review').trim().toLowerCase();
+  const modeOverride = options.mode ? String(options.mode).trim().toLowerCase() : null;
+  const mode = modeOverride || modeSetting;
+  if (mode !== 'review' && mode !== 'code') exitWithError(`start: invalid mode '${mode}', expected 'review' or 'code'`);
+
+  const defaultTimeout = mode === 'code' ? Number(config.council.settings.code_timeout || 600) : Number(config.council.settings.timeout || 0);
   const timeoutOverride = options.timeout != null ? Number(options.timeout) : null;
-  const timeoutSec = Number.isFinite(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : timeoutSetting > 0 ? timeoutSetting : 0;
+  const timeoutSec = Number.isFinite(timeoutOverride) && timeoutOverride > 0 ? timeoutOverride : defaultTimeout > 0 ? defaultTimeout : 0;
 
   const requestedMembers = config.council.members || [];
   const members = requestedMembers.filter((m) => {
@@ -510,6 +547,13 @@ function cmdStart(options, prompt) {
     if (excludeChairmanFromMembers && !includeChairman && nameLc === chairmanRole) return false;
     return true;
   });
+
+  // Code mode: verify we're in a git repo
+  let gitRoot = null;
+  if (mode === 'code') {
+    gitRoot = findGitRoot(process.cwd());
+    if (!gitRoot) exitWithError('start: code mode requires a git repository');
+  }
 
   const jobId = `${new Date().toISOString().replace(/[:.]/g, '').replace('T', '-').slice(0, 15)}-${crypto
     .randomBytes(3)
@@ -524,6 +568,8 @@ function cmdStart(options, prompt) {
   const critiqueTimeoutSetting = Number(config.council.settings.critique_timeout || 0);
   const critiqueTimeout = critiqueTimeoutSetting > 0 ? critiqueTimeoutSetting : timeoutSec;
   const critiqueIncludeSelf = normalizeBool(config.council.settings.critique_include_self) === true;
+  const cleanupWorktrees = normalizeBool(config.council.settings.cleanup_worktrees) !== false;
+  const keepWorktreesOnError = normalizeBool(config.council.settings.keep_worktrees_on_error) === true;
 
   const jobMeta = {
     id: `council-${jobId}`,
@@ -531,17 +577,21 @@ function cmdStart(options, prompt) {
     configPath,
     hostRole,
     chairmanRole,
+    mode,
     adversarial: adversarialReview,
     currentRound: 'initial',
+    gitRoot,
     settings: {
       excludeChairmanFromMembers,
       timeoutSec: timeoutSec || null,
       critiqueTimeout: critiqueTimeout || null,
       critiqueIncludeSelf,
+      cleanupWorktrees,
+      keepWorktreesOnError,
     },
     members: members.map((m) => ({
       name: String(m.name),
-      command: String(m.command),
+      command: String(mode === 'code' && m.code_command ? m.code_command : m.command),
       emoji: m.emoji ? String(m.emoji) : null,
       color: m.color ? String(m.color) : null,
     })),
@@ -554,32 +604,55 @@ function cmdStart(options, prompt) {
     : membersDir;
   ensureDir(workerBaseDir);
 
+  // Code mode: create worktrees directory
+  const worktreesDir = mode === 'code' ? path.join(jobDir, 'worktrees') : null;
+  if (worktreesDir) ensureDir(worktreesDir);
+
   for (const member of members) {
     const name = String(member.name);
     const safeName = safeFileName(name);
     const memberDir = path.join(workerBaseDir, safeName);
     ensureDir(memberDir);
 
+    // Code mode: create isolated worktree for this member
+    let worktreePath = null;
+    if (mode === 'code' && gitRoot) {
+      worktreePath = path.join(worktreesDir, safeName);
+      try {
+        createWorktree(gitRoot, worktreePath);
+      } catch (error) {
+        atomicWriteJson(path.join(memberDir, 'status.json'), {
+          member: name,
+          state: 'error',
+          message: `Failed to create worktree: ${error.message || error}`,
+          finishedAt: new Date().toISOString(),
+        });
+        continue;
+      }
+    }
+
     atomicWriteJson(path.join(memberDir, 'status.json'), {
       member: name,
       state: 'queued',
       queuedAt: new Date().toISOString(),
-      command: String(member.command),
+      command: String(mode === 'code' && member.code_command ? member.code_command : member.command),
+      worktreePath,
     });
 
+    const memberCommand = mode === 'code' && member.code_command ? member.code_command : member.command;
     const workerArgs = [
       WORKER_PATH,
-      '--job-dir',
-      jobDir,
-      '--member',
-      name,
-      '--safe-member',
-      safeName,
-      '--command',
-      String(member.command),
+      '--job-dir', jobDir,
+      '--member', name,
+      '--safe-member', safeName,
+      '--command', String(memberCommand),
+      '--mode', mode,
     ];
     if (useRounds) {
       workerArgs.push('--work-dir', memberDir);
+    }
+    if (worktreePath) {
+      workerArgs.push('--worktree-dir', worktreePath);
     }
     if (timeoutSec && Number.isFinite(timeoutSec) && timeoutSec > 0) {
       workerArgs.push('--timeout', String(timeoutSec));
@@ -600,7 +673,7 @@ function cmdStart(options, prompt) {
   }
 }
 
-function buildCritiquePrompt(originalPrompt, responses, currentMember, includeSelf) {
+function buildCritiquePrompt(originalPrompt, responses, currentMember, includeSelf, mode) {
   const otherResponses = responses.filter(
     (r) => includeSelf || r.member !== currentMember
   );
@@ -609,6 +682,45 @@ function buildCritiquePrompt(originalPrompt, responses, currentMember, includeSe
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 
+  if (mode === 'code') {
+    // Code mode: use diffs as the response content
+    const implBlocks = otherResponses
+      .map((r) => {
+        const safeName = escapePromptXml(String(r.member));
+        const diff = r.diff && r.diff.trim()
+          ? escapePromptXml(r.diff)
+          : r.state === 'done' ? '[No changes produced]' : `[Implementation unavailable: ${r.state}]`;
+        const stdout = r.output && r.output.trim() ? escapePromptXml(r.output) : '';
+        const stdoutBlock = stdout ? `\nAgent notes:\n${stdout}\n` : '';
+        return `<implementation member="${safeName}">\n${diff}${stdoutBlock}\n</implementation>`;
+      })
+      .join('\n\n');
+
+    return `You are participating in Agent Council Round 2: adversarial code review.
+
+Original user request:
+<original_request>
+${originalPrompt}
+</original_request>
+
+Below are the Round 1 implementations from other council members, shown as git diffs.
+Review each implementation for: correctness, edge cases, missing error handling,
+test coverage, performance issues, security concerns, and code style.
+
+Round 1 implementations:
+${implBlocks}
+
+Structure your review as:
+1. Strongest implementations or approaches worth preserving
+2. Bugs or correctness issues (by member)
+3. Missing edge cases, error handling, or tests
+4. Performance or security concerns
+5. Your recommended approach: which implementation to use as a base, and what to change
+
+Be specific. Reference file paths and line numbers from the diffs when possible.`;
+  }
+
+  // Review mode: use text output
   const responseBlocks = otherResponses
     .map((r) => {
       const safeName = escapePromptXml(String(r.member));
@@ -666,15 +778,19 @@ function cmdAdvance(options, jobDir) {
     ? fs.readFileSync(path.join(resolvedJobDir, 'prompt.txt'), 'utf8')
     : '';
 
-  // Issue 5: Pass ALL responses (including failed) to critique prompt
+  const jobMode = jobMeta.mode || 'review';
+
+  // Collect Round 1 responses (and diffs in code mode)
   const responses = [];
   for (const entry of fs.readdirSync(initialDir)) {
     const statusPath = path.join(initialDir, entry, 'status.json');
     const outputPath = path.join(initialDir, entry, 'output.txt');
+    const diffPath = path.join(initialDir, entry, 'diff.patch');
     const status = readJsonIfExists(statusPath);
     if (!status) continue;
     const output = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
-    responses.push({ member: status.member, safeName: entry, state: status.state, output });
+    const diff = fs.existsSync(diffPath) ? fs.readFileSync(diffPath, 'utf8') : '';
+    responses.push({ member: status.member, safeName: entry, state: status.state, output, diff });
   }
 
   if (responses.length === 0) exitWithError('advance: no Round 1 responses found');
@@ -686,7 +802,7 @@ function cmdAdvance(options, jobDir) {
   const critiqueTimeout = jobMeta.settings.critiqueTimeout || jobMeta.settings.timeoutSec || 0;
   const members = jobMeta.members || [];
 
-  // Issue 2: Three-phase approach — prepare, flip state, then spawn
+  // Three-phase approach — prepare, flip state, then spawn
   // Phase 1: Create all critique dirs, prompts, and queued status files
   const workerConfigs = [];
   for (const member of members) {
@@ -695,7 +811,7 @@ function cmdAdvance(options, jobDir) {
     const memberDir = path.join(critiqueDir, safeName);
     ensureDir(memberDir);
 
-    const critiquePrompt = buildCritiquePrompt(originalPrompt, responses, name, includeSelf);
+    const critiquePrompt = buildCritiquePrompt(originalPrompt, responses, name, includeSelf, jobMode);
     fs.writeFileSync(path.join(memberDir, 'prompt.txt'), critiquePrompt, 'utf8');
 
     atomicWriteJson(path.join(memberDir, 'status.json'), {
@@ -929,11 +1045,13 @@ function readRoundMembers(dir) {
     const statusPath = path.join(dir, entry, 'status.json');
     const outputPath = path.join(dir, entry, 'output.txt');
     const errorPath = path.join(dir, entry, 'error.txt');
+    const diffPath = path.join(dir, entry, 'diff.patch');
     const status = readJsonIfExists(statusPath);
     if (!status) continue;
     const output = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
     const stderr = fs.existsSync(errorPath) ? fs.readFileSync(errorPath, 'utf8') : '';
-    members.push({ safeName: entry, ...status, output, stderr });
+    const diff = fs.existsSync(diffPath) ? fs.readFileSync(diffPath, 'utf8') : '';
+    members.push({ safeName: entry, ...status, output, stderr, diff });
   }
   return members.sort((a, b) => String(a.member).localeCompare(String(b.member)));
 }
@@ -942,6 +1060,7 @@ function cmdResults(options, jobDir) {
   const resolvedJobDir = path.resolve(jobDir);
   const jobMeta = readJsonIfExists(path.join(resolvedJobDir, 'job.json'));
   const isAdversarial = jobMeta && jobMeta.adversarial === true;
+  const jobMode = jobMeta ? (jobMeta.mode || 'review') : 'review';
 
   const prompt = fs.existsSync(path.join(resolvedJobDir, 'prompt.txt'))
     ? fs.readFileSync(path.join(resolvedJobDir, 'prompt.txt'), 'utf8')
@@ -956,19 +1075,27 @@ function cmdResults(options, jobDir) {
     critiqueMembers = [];
   }
 
-  const formatMember = (m) => ({
-    member: m.member,
-    state: m.state,
-    exitCode: m.exitCode != null ? m.exitCode : null,
-    message: m.message || null,
-    output: m.output,
-    stderr: m.stderr,
-  });
+  const formatMember = (m) => {
+    const result = {
+      member: m.member,
+      state: m.state,
+      exitCode: m.exitCode != null ? m.exitCode : null,
+      message: m.message || null,
+      output: m.output,
+      stderr: m.stderr,
+    };
+    if (jobMode === 'code' && m.diff) {
+      result.diff = m.diff;
+      result.hasDiff = m.diff.trim().length > 0;
+    }
+    return result;
+  };
 
   if (options.json) {
     const result = {
       jobDir: resolvedJobDir,
       id: jobMeta ? jobMeta.id : null,
+      mode: jobMode,
       adversarial: isAdversarial,
       chairmanRole: jobMeta ? jobMeta.chairmanRole : null,
       prompt,
@@ -985,16 +1112,24 @@ function cmdResults(options, jobDir) {
     return;
   }
 
+  const round1Label = jobMode === 'code' ? 'Round 1: Implementations' : 'Round 1: Initial Responses';
   if (isAdversarial) {
-    process.stdout.write('\n=== Round 1: Initial Responses ===\n');
+    process.stdout.write(`\n=== ${round1Label} ===\n`);
   }
   for (const m of initialMembers) {
     process.stdout.write(`\n--- ${m.member} (${m.state}) ---\n`);
     if (m.message) process.stdout.write(`${m.message}\n`);
-    process.stdout.write(m.output || '');
-    if (!m.output && m.stderr) {
-      process.stdout.write('\n');
-      process.stdout.write(m.stderr);
+    if (jobMode === 'code' && m.diff && m.diff.trim()) {
+      process.stdout.write(`Diff (${m.diff.split('\n').length} lines):\n${m.diff}\n`);
+      if (m.output && m.output.trim()) {
+        process.stdout.write(`Agent notes:\n${m.output}\n`);
+      }
+    } else {
+      process.stdout.write(m.output || '');
+      if (!m.output && m.stderr) {
+        process.stdout.write('\n');
+        process.stdout.write(m.stderr);
+      }
     }
     process.stdout.write('\n');
   }
@@ -1051,6 +1186,23 @@ function cmdStop(_options, jobDir) {
 
 function cmdClean(_options, jobDir) {
   const resolvedJobDir = path.resolve(jobDir);
+  const jobMeta = readJsonIfExists(path.join(resolvedJobDir, 'job.json'));
+
+  // Clean up git worktrees before removing the job directory
+  if (jobMeta && jobMeta.mode === 'code' && jobMeta.gitRoot) {
+    const worktreesDir = path.join(resolvedJobDir, 'worktrees');
+    if (fs.existsSync(worktreesDir)) {
+      for (const entry of fs.readdirSync(worktreesDir)) {
+        const wtPath = path.join(worktreesDir, entry);
+        removeWorktree(jobMeta.gitRoot, wtPath);
+      }
+    }
+    // Prune any orphaned worktree references
+    try {
+      execSync('git worktree prune', { cwd: jobMeta.gitRoot, stdio: 'ignore' });
+    } catch { /* ignore */ }
+  }
+
   fs.rmSync(resolvedJobDir, { recursive: true, force: true });
   process.stdout.write(`cleaned: ${resolvedJobDir}\n`);
 }
