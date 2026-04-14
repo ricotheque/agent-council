@@ -41,3 +41,8 @@ council:
     timeout: 120            # Timeout seconds per agent (0 to disable)
     exclude_chairman_from_members: true  # Avoid calling the chairman as a member by default
     # synthesize: true       # Force Stage 3 synthesis inside council.sh (requires chairman.command or --chairman codex/gemini)
+
+    # Adversarial review: after Round 1 responses, each agent critiques the others
+    adversarial_review: true
+    critique_timeout: 120   # Timeout for the critique round (defaults to timeout if omitted)
+    critique_include_self: false  # Whether agents see their own Round 1 response in the critique

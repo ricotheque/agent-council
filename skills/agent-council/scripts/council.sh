@@ -62,7 +62,7 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 case "$1" in
-  start|status|wait|results|stop|clean)
+  start|status|wait|advance|results|stop|clean)
     exec "$JOB_SCRIPT" "$@"
     ;;
 esac
@@ -106,20 +106,40 @@ cleanup_on_signal() {
 
 trap cleanup_on_signal INT TERM
 
-while true; do
-  WAIT_JSON="$("$JOB_SCRIPT" wait "$JOB_DIR")"
-  OVERALL="$(printf '%s' "$WAIT_JSON" | node -e '
+wait_for_round() {
+  while true; do
+    WAIT_JSON="$("$JOB_SCRIPT" wait "$JOB_DIR")"
+    OVERALL="$(printf '%s' "$WAIT_JSON" | node -e '
 const fs=require("fs");
 const d=JSON.parse(fs.readFileSync(0,"utf8"));
 process.stdout.write(String(d.overallState||""));
 ')"
 
-  "$JOB_SCRIPT" status --text "$JOB_DIR" >&2
+    "$JOB_SCRIPT" status --text "$JOB_DIR" >&2
 
-  if [ "$OVERALL" = "done" ]; then
-    break
-  fi
-done
+    if [ "$OVERALL" = "done" ]; then
+      break
+    fi
+  done
+}
+
+# Wait for Round 1
+wait_for_round
+
+# Check if adversarial mode — advance to critique round if so
+IS_ADVERSARIAL="$(node -e '
+const fs=require("fs");
+const p=require("path");
+const j=JSON.parse(fs.readFileSync(p.join(process.argv[1],"job.json"),"utf8"));
+process.stdout.write(j.adversarial && j.currentRound==="initial" ? "yes" : "no");
+' "$JOB_DIR")"
+
+if [ "$IS_ADVERSARIAL" = "yes" ]; then
+  echo "council: advancing to adversarial review round" >&2
+  "$JOB_SCRIPT" advance "$JOB_DIR" >&2
+  # Wait for Round 2
+  wait_for_round
+fi
 
 trap - INT TERM
 

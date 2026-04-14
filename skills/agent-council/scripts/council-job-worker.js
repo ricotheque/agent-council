@@ -92,19 +92,20 @@ function main() {
   const safeMember = options['safe-member'];
   const command = options.command;
   const timeoutSec = options.timeout ? Number(options.timeout) : 0;
+  const workDir = options['work-dir'];
+  const promptFile = options['prompt-file'];
 
   if (!jobDir) exitWithError('worker: missing --job-dir');
   if (!member) exitWithError('worker: missing --member');
   if (!safeMember) exitWithError('worker: missing --safe-member');
   if (!command) exitWithError('worker: missing --command');
 
-  const membersRoot = path.join(jobDir, 'members');
-  const memberDir = path.join(membersRoot, safeMember);
+  const memberDir = workDir || path.join(path.join(jobDir, 'members'), safeMember);
   const statusPath = path.join(memberDir, 'status.json');
   const outPath = path.join(memberDir, 'output.txt');
   const errPath = path.join(memberDir, 'error.txt');
 
-  const promptPath = path.join(jobDir, 'prompt.txt');
+  const promptPath = promptFile || path.join(jobDir, 'prompt.txt');
   const prompt = fs.existsSync(promptPath) ? fs.readFileSync(promptPath, 'utf8') : '';
 
   const tokens = splitCommand(command);

@@ -181,6 +181,8 @@ function buildCouncilUiPayload(statusPayload) {
   const done = computeTerminalDoneCount(counts);
   const total = Number(counts.total || 0);
   const isDone = String(statusPayload.overallState || '') === 'done';
+  const isAdversarial = statusPayload.adversarial === true;
+  const currentRound = statusPayload.currentRound || 'initial';
 
   const queued = Number(counts.queued || 0);
   const running = Number(counts.running || 0);
@@ -196,16 +198,18 @@ function buildCouncilUiPayload(statusPayload) {
     .sort((a, b) => a.member.localeCompare(b.member));
 
   const terminalStates = new Set(['done', 'missing_cli', 'error', 'timed_out', 'canceled']);
-  // Keep the Plan UI visible by ensuring exactly one `in_progress` item while work remains.
   const dispatchStatus = asCodexStepStatus(isDone ? 'completed' : queued > 0 ? 'in_progress' : 'completed');
   let hasInProgress = dispatchStatus === 'in_progress';
 
+  const round1Label = isAdversarial ? ' (Round 1)' : '';
   const memberSteps = sortedMembers.map((m) => {
     const state = m.state || 'unknown';
     const isTerminal = terminalStates.has(state);
 
     let status;
-    if (isTerminal) {
+    if (currentRound !== 'initial') {
+      status = 'completed';
+    } else if (isTerminal) {
       status = 'completed';
     } else if (!hasInProgress && running > 0 && state === 'running') {
       status = 'in_progress';
@@ -214,16 +218,53 @@ function buildCouncilUiPayload(statusPayload) {
       status = 'pending';
     }
 
-    const label = `[Council] Ask ${m.member}`;
+    const label = `[Council] Ask ${m.member}${round1Label}`;
     return { label, status: asCodexStepStatus(status) };
   });
 
-  // Once members are done, the host agent should synthesize and then mark this step completed.
-  const synthStatus = asCodexStepStatus(isDone ? (hasInProgress ? 'pending' : 'in_progress') : 'pending');
+  const challengeSteps = [];
+  if (isAdversarial) {
+    const advanceStatus = currentRound === 'initial'
+      ? 'pending'
+      : 'completed';
+
+    challengeSteps.push({
+      label: '[Council] Adversarial review',
+      status: asCodexStepStatus(advanceStatus),
+      activeForm: advanceStatus === 'completed' ? 'Dispatched critique prompts' : 'Waiting for Round 1',
+    });
+
+    for (const m of sortedMembers) {
+      let status;
+      if (currentRound !== 'critique') {
+        status = 'pending';
+      } else {
+        const state = m.state || 'unknown';
+        const isTerminal = terminalStates.has(state);
+        if (isTerminal) {
+          status = 'completed';
+        } else if (!hasInProgress && running > 0 && state === 'running') {
+          status = 'in_progress';
+          hasInProgress = true;
+        } else {
+          status = 'pending';
+        }
+      }
+      challengeSteps.push({
+        label: `[Council] Challenge ${m.member} (Round 2)`,
+        status: asCodexStepStatus(status),
+        activeForm: status === 'completed' ? 'Finished' : 'Awaiting critique',
+      });
+    }
+  }
+
+  const allRoundsDone = isDone && (!isAdversarial || currentRound === 'critique');
+  const synthStatus = asCodexStepStatus(allRoundsDone ? (hasInProgress ? 'pending' : 'in_progress') : 'pending');
 
   const codexPlan = [
     { step: `[Council] Prompt dispatch`, status: dispatchStatus },
     ...memberSteps.map((s) => ({ step: s.label, status: s.status })),
+    ...challengeSteps.map((s) => ({ step: s.label, status: s.status })),
     { step: `[Council] Synthesize`, status: synthStatus },
   ];
 
@@ -237,6 +278,11 @@ function buildCouncilUiPayload(statusPayload) {
       content: s.label,
       status: s.status,
       activeForm: s.status === 'completed' ? 'Finished' : 'Awaiting response',
+    })),
+    ...challengeSteps.map((s) => ({
+      content: s.label,
+      status: s.status,
+      activeForm: s.activeForm,
     })),
     {
       content: `[Council] Synthesize`,
@@ -257,6 +303,17 @@ function buildCouncilUiPayload(statusPayload) {
   };
 }
 
+function readMembersFromDir(dir) {
+  const members = [];
+  if (!fs.existsSync(dir)) return members;
+  for (const entry of fs.readdirSync(dir)) {
+    const statusPath = path.join(dir, entry, 'status.json');
+    const status = readJsonIfExists(statusPath);
+    if (status) members.push({ safeName: entry, ...status });
+  }
+  return members;
+}
+
 function computeStatusPayload(jobDir) {
   const resolvedJobDir = path.resolve(jobDir);
   if (!fs.existsSync(resolvedJobDir)) exitWithError(`jobDir not found: ${resolvedJobDir}`);
@@ -264,15 +321,18 @@ function computeStatusPayload(jobDir) {
   const jobMeta = readJsonIfExists(path.join(resolvedJobDir, 'job.json'));
   if (!jobMeta) exitWithError(`job.json not found: ${path.join(resolvedJobDir, 'job.json')}`);
 
-  const membersRoot = path.join(resolvedJobDir, 'members');
-  if (!fs.existsSync(membersRoot)) exitWithError(`members folder not found: ${membersRoot}`);
+  const isAdversarial = jobMeta.adversarial === true;
+  const currentRound = jobMeta.currentRound || 'initial';
 
-  const members = [];
-  for (const entry of fs.readdirSync(membersRoot)) {
-    const statusPath = path.join(membersRoot, entry, 'status.json');
-    const status = readJsonIfExists(statusPath);
-    if (status) members.push({ safeName: entry, ...status });
+  let activeDir;
+  if (isAdversarial) {
+    activeDir = path.join(resolvedJobDir, 'rounds', currentRound);
+  } else {
+    activeDir = path.join(resolvedJobDir, 'members');
   }
+  if (!fs.existsSync(activeDir)) exitWithError(`active round directory not found: ${activeDir}`);
+
+  const members = readMembersFromDir(activeDir);
 
   const totals = { queued: 0, running: 0, done: 0, error: 0, missing_cli: 0, timed_out: 0, canceled: 0 };
   for (const m of members) {
@@ -287,6 +347,8 @@ function computeStatusPayload(jobDir) {
     jobDir: resolvedJobDir,
     id: jobMeta.id || null,
     chairmanRole: jobMeta.chairmanRole || null,
+    adversarial: isAdversarial,
+    currentRound,
     overallState,
     counts: { total: members.length, ...totals },
     members: members
@@ -356,6 +418,7 @@ Usage:
   council-job.sh start [--config path] [--chairman auto|claude|codex|...] [--jobs-dir path] [--json] "question"
   council-job.sh status [--json|--text|--checklist] [--verbose] <jobDir>
   council-job.sh wait [--cursor CURSOR] [--bucket auto|N] [--interval-ms N] [--timeout-ms N] <jobDir>
+  council-job.sh advance [--json] <jobDir>
   council-job.sh results [--json] <jobDir>
   council-job.sh stop <jobDir>
   council-job.sh clean <jobDir>
@@ -364,6 +427,7 @@ Notes:
   - start returns immediately and runs members in parallel via detached Node workers
   - poll status with repeated short calls to update TODO/plan UIs in host agents
   - wait prints JSON by default and blocks until meaningful progress occurs, so you don't spam tool cells
+  - advance transitions from Round 1 to the adversarial critique round (requires adversarial_review: true in config)
 `);
 }
 
@@ -408,15 +472,24 @@ function cmdStart(options, prompt) {
 
   fs.writeFileSync(path.join(jobDir, 'prompt.txt'), String(prompt), 'utf8');
 
+  const adversarialReview = normalizeBool(config.council.settings.adversarial_review) === true;
+  const critiqueTimeoutSetting = Number(config.council.settings.critique_timeout || 0);
+  const critiqueTimeout = critiqueTimeoutSetting > 0 ? critiqueTimeoutSetting : timeoutSec;
+  const critiqueIncludeSelf = normalizeBool(config.council.settings.critique_include_self) === true;
+
   const jobMeta = {
     id: `council-${jobId}`,
     createdAt: new Date().toISOString(),
     configPath,
     hostRole,
     chairmanRole,
+    adversarial: adversarialReview,
+    currentRound: 'initial',
     settings: {
       excludeChairmanFromMembers,
       timeoutSec: timeoutSec || null,
+      critiqueTimeout: critiqueTimeout || null,
+      critiqueIncludeSelf,
     },
     members: members.map((m) => ({
       name: String(m.name),
@@ -427,10 +500,16 @@ function cmdStart(options, prompt) {
   };
   atomicWriteJson(path.join(jobDir, 'job.json'), jobMeta);
 
+  const useRounds = adversarialReview;
+  const workerBaseDir = useRounds
+    ? path.join(jobDir, 'rounds', 'initial')
+    : membersDir;
+  ensureDir(workerBaseDir);
+
   for (const member of members) {
     const name = String(member.name);
     const safeName = safeFileName(name);
-    const memberDir = path.join(membersDir, safeName);
+    const memberDir = path.join(workerBaseDir, safeName);
     ensureDir(memberDir);
 
     atomicWriteJson(path.join(memberDir, 'status.json'), {
@@ -451,6 +530,9 @@ function cmdStart(options, prompt) {
       '--command',
       String(member.command),
     ];
+    if (useRounds) {
+      workerArgs.push('--work-dir', memberDir);
+    }
     if (timeoutSec && Number.isFinite(timeoutSec) && timeoutSec > 0) {
       workerArgs.push('--timeout', String(timeoutSec));
     }
@@ -467,6 +549,134 @@ function cmdStart(options, prompt) {
     process.stdout.write(`${JSON.stringify({ jobDir, ...jobMeta }, null, 2)}\n`);
   } else {
     process.stdout.write(`${jobDir}\n`);
+  }
+}
+
+function buildCritiquePrompt(originalPrompt, responses, currentMember, includeSelf) {
+  const otherResponses = responses.filter(
+    (r) => includeSelf || r.member !== currentMember
+  );
+
+  const responseBlocks = otherResponses
+    .map(
+      (r) =>
+        `<response member="${r.member}">\n${r.output}\n</response>`
+    )
+    .join('\n\n');
+
+  return `You are participating in Agent Council Round 2: adversarial review.
+
+Original user request:
+<original_request>
+${originalPrompt}
+</original_request>
+
+Below are the Round 1 responses from other council members. Critique them rigorously.
+Your goal is not to re-answer from scratch unless needed. Find flaws, missed edge cases,
+questionable assumptions, weak evidence, implementation risks, and places where an approach
+would fail in practice.
+
+Round 1 responses:
+${responseBlocks}
+
+Structure your critique as:
+1. Strongest points worth preserving
+2. Problems (by member)
+3. Missed edge cases or constraints
+4. Assumptions that need verification
+5. Your revised recommendation, if the critiques change your view
+
+Be concrete. Reference member names when critiquing. Do not invent facts that are not in the
+original request or responses. If a response is unavailable, errored, or timed out, say so briefly
+and critique only the available material.`;
+}
+
+function cmdAdvance(options, jobDir) {
+  const resolvedJobDir = path.resolve(jobDir);
+  const jobMeta = readJsonIfExists(path.join(resolvedJobDir, 'job.json'));
+  if (!jobMeta) exitWithError(`advance: job.json not found in ${resolvedJobDir}`);
+  if (!jobMeta.adversarial) exitWithError('advance: job is not in adversarial mode');
+  if (jobMeta.currentRound !== 'initial') exitWithError(`advance: expected currentRound=initial, got ${jobMeta.currentRound}`);
+
+  const initialDir = path.join(resolvedJobDir, 'rounds', 'initial');
+  if (!fs.existsSync(initialDir)) exitWithError(`advance: initial round directory not found: ${initialDir}`);
+
+  const originalPrompt = fs.existsSync(path.join(resolvedJobDir, 'prompt.txt'))
+    ? fs.readFileSync(path.join(resolvedJobDir, 'prompt.txt'), 'utf8')
+    : '';
+
+  const responses = [];
+  for (const entry of fs.readdirSync(initialDir)) {
+    const statusPath = path.join(initialDir, entry, 'status.json');
+    const outputPath = path.join(initialDir, entry, 'output.txt');
+    const status = readJsonIfExists(statusPath);
+    if (!status) continue;
+    const output = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
+    responses.push({ member: status.member, safeName: entry, state: status.state, output });
+  }
+
+  const successfulResponses = responses.filter((r) => r.state === 'done' && r.output.trim());
+  if (successfulResponses.length === 0) exitWithError('advance: no successful Round 1 responses to critique');
+
+  const critiqueDir = path.join(resolvedJobDir, 'rounds', 'critique');
+  ensureDir(critiqueDir);
+
+  const includeSelf = jobMeta.settings.critiqueIncludeSelf || false;
+  const critiqueTimeout = jobMeta.settings.critiqueTimeout || jobMeta.settings.timeoutSec || 0;
+  const members = jobMeta.members || [];
+
+  for (const member of members) {
+    const name = String(member.name);
+    const safeName = safeFileName(name);
+    const memberDir = path.join(critiqueDir, safeName);
+    ensureDir(memberDir);
+
+    const critiquePrompt = buildCritiquePrompt(originalPrompt, successfulResponses, name, includeSelf);
+    fs.writeFileSync(path.join(memberDir, 'prompt.txt'), critiquePrompt, 'utf8');
+
+    atomicWriteJson(path.join(memberDir, 'status.json'), {
+      member: name,
+      state: 'queued',
+      queuedAt: new Date().toISOString(),
+      command: String(member.command),
+      round: 'critique',
+    });
+
+    const workerArgs = [
+      WORKER_PATH,
+      '--job-dir',
+      resolvedJobDir,
+      '--member',
+      name,
+      '--safe-member',
+      safeName,
+      '--command',
+      String(member.command),
+      '--work-dir',
+      memberDir,
+      '--prompt-file',
+      path.join(memberDir, 'prompt.txt'),
+    ];
+    if (critiqueTimeout && Number.isFinite(critiqueTimeout) && critiqueTimeout > 0) {
+      workerArgs.push('--timeout', String(critiqueTimeout));
+    }
+
+    const child = spawn(process.execPath, workerArgs, {
+      detached: true,
+      stdio: 'ignore',
+      env: process.env,
+    });
+    child.unref();
+  }
+
+  jobMeta.currentRound = 'critique';
+  jobMeta.advancedAt = new Date().toISOString();
+  atomicWriteJson(path.join(resolvedJobDir, 'job.json'), jobMeta);
+
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify({ jobDir: resolvedJobDir, currentRound: 'critique', members: members.length }, null, 2)}\n`);
+  } else {
+    process.stdout.write(`advanced: ${resolvedJobDir} → critique round (${members.length} members)\n`);
   }
 }
 
@@ -649,54 +859,73 @@ function cmdWait(options, jobDir) {
   process.stdout.write(`${JSON.stringify({ ...asWaitPayload(finalPayload), cursor: finalCursor }, null, 2)}\n`);
 }
 
+function readRoundMembers(dir) {
+  const members = [];
+  if (!fs.existsSync(dir)) return members;
+  for (const entry of fs.readdirSync(dir)) {
+    const statusPath = path.join(dir, entry, 'status.json');
+    const outputPath = path.join(dir, entry, 'output.txt');
+    const errorPath = path.join(dir, entry, 'error.txt');
+    const status = readJsonIfExists(statusPath);
+    if (!status) continue;
+    const output = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
+    const stderr = fs.existsSync(errorPath) ? fs.readFileSync(errorPath, 'utf8') : '';
+    members.push({ safeName: entry, ...status, output, stderr });
+  }
+  return members.sort((a, b) => String(a.member).localeCompare(String(b.member)));
+}
+
 function cmdResults(options, jobDir) {
   const resolvedJobDir = path.resolve(jobDir);
   const jobMeta = readJsonIfExists(path.join(resolvedJobDir, 'job.json'));
-  const membersRoot = path.join(resolvedJobDir, 'members');
+  const isAdversarial = jobMeta && jobMeta.adversarial === true;
 
-  const members = [];
-  if (fs.existsSync(membersRoot)) {
-    for (const entry of fs.readdirSync(membersRoot)) {
-      const statusPath = path.join(membersRoot, entry, 'status.json');
-      const outputPath = path.join(membersRoot, entry, 'output.txt');
-      const errorPath = path.join(membersRoot, entry, 'error.txt');
-      const status = readJsonIfExists(statusPath);
-      if (!status) continue;
-      const output = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8') : '';
-      const stderr = fs.existsSync(errorPath) ? fs.readFileSync(errorPath, 'utf8') : '';
-      members.push({ safeName: entry, ...status, output, stderr });
-    }
+  const prompt = fs.existsSync(path.join(resolvedJobDir, 'prompt.txt'))
+    ? fs.readFileSync(path.join(resolvedJobDir, 'prompt.txt'), 'utf8')
+    : null;
+
+  let initialMembers, critiqueMembers;
+  if (isAdversarial) {
+    initialMembers = readRoundMembers(path.join(resolvedJobDir, 'rounds', 'initial'));
+    critiqueMembers = readRoundMembers(path.join(resolvedJobDir, 'rounds', 'critique'));
+  } else {
+    initialMembers = readRoundMembers(path.join(resolvedJobDir, 'members'));
+    critiqueMembers = [];
   }
 
+  const formatMember = (m) => ({
+    member: m.member,
+    state: m.state,
+    exitCode: m.exitCode != null ? m.exitCode : null,
+    message: m.message || null,
+    output: m.output,
+    stderr: m.stderr,
+  });
+
   if (options.json) {
-    process.stdout.write(
-      `${JSON.stringify(
-        {
-          jobDir: resolvedJobDir,
-          id: jobMeta ? jobMeta.id : null,
-          prompt: fs.existsSync(path.join(resolvedJobDir, 'prompt.txt'))
-            ? fs.readFileSync(path.join(resolvedJobDir, 'prompt.txt'), 'utf8')
-            : null,
-          members: members
-            .map((m) => ({
-              member: m.member,
-              state: m.state,
-              exitCode: m.exitCode != null ? m.exitCode : null,
-              message: m.message || null,
-              output: m.output,
-              stderr: m.stderr,
-            }))
-            .sort((a, b) => String(a.member).localeCompare(String(b.member))),
-        },
-        null,
-        2
-      )}\n`
-    );
+    const result = {
+      jobDir: resolvedJobDir,
+      id: jobMeta ? jobMeta.id : null,
+      adversarial: isAdversarial,
+      prompt,
+    };
+    if (isAdversarial) {
+      result.rounds = {
+        initial: initialMembers.map(formatMember),
+        critique: critiqueMembers.map(formatMember),
+      };
+    } else {
+      result.members = initialMembers.map(formatMember);
+    }
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     return;
   }
 
-  for (const m of members.sort((a, b) => String(a.member).localeCompare(String(b.member)))) {
-    process.stdout.write(`\n=== ${m.member} (${m.state}) ===\n`);
+  if (isAdversarial) {
+    process.stdout.write('\n=== Round 1: Initial Responses ===\n');
+  }
+  for (const m of initialMembers) {
+    process.stdout.write(`\n--- ${m.member} (${m.state}) ---\n`);
     if (m.message) process.stdout.write(`${m.message}\n`);
     process.stdout.write(m.output || '');
     if (!m.output && m.stderr) {
@@ -705,27 +934,52 @@ function cmdResults(options, jobDir) {
     }
     process.stdout.write('\n');
   }
+
+  if (isAdversarial && critiqueMembers.length > 0) {
+    process.stdout.write('\n=== Round 2: Adversarial Critiques ===\n');
+    for (const m of critiqueMembers) {
+      process.stdout.write(`\n--- ${m.member} critique (${m.state}) ---\n`);
+      if (m.message) process.stdout.write(`${m.message}\n`);
+      process.stdout.write(m.output || '');
+      if (!m.output && m.stderr) {
+        process.stdout.write('\n');
+        process.stdout.write(m.stderr);
+      }
+      process.stdout.write('\n');
+    }
+  }
 }
 
-function cmdStop(_options, jobDir) {
-  const resolvedJobDir = path.resolve(jobDir);
-  const membersRoot = path.join(resolvedJobDir, 'members');
-  if (!fs.existsSync(membersRoot)) exitWithError(`No members folder found: ${membersRoot}`);
-
+function stopMembersInDir(dir) {
   let stoppedAny = false;
-  for (const entry of fs.readdirSync(membersRoot)) {
-    const statusPath = path.join(membersRoot, entry, 'status.json');
+  if (!fs.existsSync(dir)) return stoppedAny;
+  for (const entry of fs.readdirSync(dir)) {
+    const statusPath = path.join(dir, entry, 'status.json');
     const status = readJsonIfExists(statusPath);
     if (!status) continue;
     if (status.state !== 'running') continue;
     if (!status.pid) continue;
-
     try {
       process.kill(Number(status.pid), 'SIGTERM');
       stoppedAny = true;
     } catch {
       // ignore
     }
+  }
+  return stoppedAny;
+}
+
+function cmdStop(_options, jobDir) {
+  const resolvedJobDir = path.resolve(jobDir);
+  const jobMeta = readJsonIfExists(path.join(resolvedJobDir, 'job.json'));
+  const isAdversarial = jobMeta && jobMeta.adversarial === true;
+
+  let stoppedAny = false;
+  if (isAdversarial) {
+    stoppedAny = stopMembersInDir(path.join(resolvedJobDir, 'rounds', 'initial')) || stoppedAny;
+    stoppedAny = stopMembersInDir(path.join(resolvedJobDir, 'rounds', 'critique')) || stoppedAny;
+  } else {
+    stoppedAny = stopMembersInDir(path.join(resolvedJobDir, 'members'));
   }
 
   process.stdout.write(stoppedAny ? 'stop: sent SIGTERM to running members\n' : 'stop: no running members\n');
@@ -762,6 +1016,12 @@ function main() {
     const jobDir = rest[0];
     if (!jobDir) exitWithError('wait: missing jobDir');
     cmdWait(options, jobDir);
+    return;
+  }
+  if (command === 'advance') {
+    const jobDir = rest[0];
+    if (!jobDir) exitWithError('advance: missing jobDir');
+    cmdAdvance(options, jobDir);
     return;
   }
   if (command === 'results') {
