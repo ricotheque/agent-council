@@ -38,8 +38,14 @@ function normalizeBool(value) {
   return null;
 }
 
-function resolveAutoRole(role, hostRole) {
+function resolveAutoRole(role, hostRole, memberNames) {
   const roleLc = String(role || '').trim().toLowerCase();
+  if (roleLc === 'random' && Array.isArray(memberNames) && memberNames.length > 0) {
+    const hostLc = String(hostRole || '').toLowerCase();
+    const candidates = hostLc ? [hostLc, ...memberNames.map(n => n.toLowerCase())] : memberNames.map(n => n.toLowerCase());
+    const unique = [...new Set(candidates)];
+    return unique[Math.floor(Math.random() * unique.length)];
+  }
   if (roleLc && roleLc !== 'auto') return roleLc;
   if (hostRole === 'codex') return 'codex';
   if (hostRole === 'claude') return 'claude';
@@ -49,13 +55,13 @@ function resolveAutoRole(role, hostRole) {
 function parseCouncilConfig(configPath) {
   const fallback = {
     council: {
-      chairman: { role: 'auto' },
+      chairman: { role: 'random' },
       members: [
         { name: 'claude', command: 'claude -p', emoji: '🧠', color: 'CYAN' },
         { name: 'codex', command: 'codex exec', emoji: '🤖', color: 'BLUE' },
         { name: 'gemini', command: 'gemini', emoji: '💎', color: 'GREEN' },
       ],
-      settings: { exclude_chairman_from_members: true, timeout: 120 },
+      settings: { exclude_chairman_from_members: false, timeout: 120 },
     },
   };
 
@@ -449,8 +455,11 @@ function cmdStart(options, prompt) {
 
   const hostRole = detectHostRole();
   const config = parseCouncilConfig(configPath);
+  const requestedMemberNames = (config.council.members || [])
+    .filter(m => m && m.name)
+    .map(m => String(m.name));
   const chairmanRoleRaw = options.chairman || process.env.COUNCIL_CHAIRMAN || config.council.chairman.role || 'auto';
-  const chairmanRole = resolveAutoRole(chairmanRoleRaw, hostRole);
+  const chairmanRole = resolveAutoRole(chairmanRoleRaw, hostRole, requestedMemberNames);
 
   const includeChairman = Boolean(options['include-chairman']);
   const excludeChairmanOverride =
@@ -926,6 +935,7 @@ function cmdResults(options, jobDir) {
       jobDir: resolvedJobDir,
       id: jobMeta ? jobMeta.id : null,
       adversarial: isAdversarial,
+      chairmanRole: jobMeta ? jobMeta.chairmanRole : null,
       prompt,
     };
     if (isAdversarial) {

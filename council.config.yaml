@@ -29,9 +29,10 @@ council:
 
   # Chairman configuration (Claude will act as chairman)
   chairman:
-    # role: auto|claude|codex|gemini|...
+    # role: random|auto|claude|codex|gemini|...
+    # - random: pick a random member each session (all models participate as peers)
     # - auto: infer from host tool (Claude Code => claude, Codex CLI => codex)
-    role: "auto"
+    role: "random"
     description: "Synthesizes all opinions and provides final recommendation"
     # Optional: run synthesis inside council.sh via CLI (otherwise the host agent synthesizes)
     # command: "codex exec"
@@ -39,7 +40,7 @@ council:
   # Execution settings
   settings:
     timeout: 120            # Timeout seconds per agent (0 to disable)
-    exclude_chairman_from_members: true  # Avoid calling the chairman as a member by default
+    exclude_chairman_from_members: false  # All models participate as peers
     # synthesize: true       # Force Stage 3 synthesis inside council.sh (requires chairman.command or --chairman codex/gemini)
 
     # Adversarial review: after Round 1 responses, each agent critiques the others
