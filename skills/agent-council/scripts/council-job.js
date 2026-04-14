@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, execFileSync } = require('child_process');
 
 const SCRIPT_DIR = __dirname;
 const SKILL_DIR = path.resolve(SCRIPT_DIR, '..');
@@ -478,30 +478,30 @@ Notes:
 
 function findGitRoot(startDir) {
   try {
-    return execSync('git rev-parse --show-toplevel', { cwd: startDir || process.cwd(), encoding: 'utf8' }).trim();
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: startDir || process.cwd(), encoding: 'utf8' }).trim();
   } catch {
     return null;
   }
 }
 
-function createWorktree(gitRoot, worktreePath, branchName) {
-  ensureDir(path.dirname(worktreePath));
-  execSync(`git worktree add --detach "${worktreePath}"`, { cwd: gitRoot, stdio: 'ignore' });
-  return worktreePath;
+function getBaseCommit(gitRoot) {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], { cwd: gitRoot, encoding: 'utf8' }).trim();
+  } catch {
+    return null;
+  }
 }
 
-function collectWorktreeDiff(worktreePath) {
-  try {
-    execSync('git add -A', { cwd: worktreePath, stdio: 'ignore' });
-    return execSync('git diff --cached HEAD', { cwd: worktreePath, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
-  } catch {
-    return '';
-  }
+function createWorktree(gitRoot, worktreePath, baseCommit) {
+  ensureDir(path.dirname(worktreePath));
+  const commitRef = baseCommit || 'HEAD';
+  execFileSync('git', ['worktree', 'add', '--detach', worktreePath, commitRef], { cwd: gitRoot, stdio: 'ignore' });
+  return worktreePath;
 }
 
 function removeWorktree(gitRoot, worktreePath) {
   try {
-    execSync(`git worktree remove --force "${worktreePath}"`, { cwd: gitRoot, stdio: 'ignore' });
+    execFileSync('git', ['worktree', 'remove', '--force', worktreePath], { cwd: gitRoot, stdio: 'ignore' });
   } catch {
     // Best-effort: may already be removed
   }
@@ -548,11 +548,14 @@ function cmdStart(options, prompt) {
     return true;
   });
 
-  // Code mode: verify we're in a git repo
+  // Code mode: verify we're in a git repo and pin the base commit
   let gitRoot = null;
+  let baseCommit = null;
   if (mode === 'code') {
     gitRoot = findGitRoot(process.cwd());
     if (!gitRoot) exitWithError('start: code mode requires a git repository');
+    baseCommit = getBaseCommit(gitRoot);
+    if (!baseCommit) exitWithError('start: failed to resolve HEAD commit');
   }
 
   const jobId = `${new Date().toISOString().replace(/[:.]/g, '').replace('T', '-').slice(0, 15)}-${crypto
@@ -581,6 +584,7 @@ function cmdStart(options, prompt) {
     adversarial: adversarialReview,
     currentRound: 'initial',
     gitRoot,
+    baseCommit,
     settings: {
       excludeChairmanFromMembers,
       timeoutSec: timeoutSec || null,
@@ -592,6 +596,7 @@ function cmdStart(options, prompt) {
     members: members.map((m) => ({
       name: String(m.name),
       command: String(mode === 'code' && m.code_command ? m.code_command : m.command),
+      reviewCommand: String(m.command),
       emoji: m.emoji ? String(m.emoji) : null,
       color: m.color ? String(m.color) : null,
     })),
@@ -619,7 +624,7 @@ function cmdStart(options, prompt) {
     if (mode === 'code' && gitRoot) {
       worktreePath = path.join(worktreesDir, safeName);
       try {
-        createWorktree(gitRoot, worktreePath);
+        createWorktree(gitRoot, worktreePath, baseCommit);
       } catch (error) {
         atomicWriteJson(path.join(memberDir, 'status.json'), {
           member: name,
@@ -653,6 +658,9 @@ function cmdStart(options, prompt) {
     }
     if (worktreePath) {
       workerArgs.push('--worktree-dir', worktreePath);
+    }
+    if (baseCommit) {
+      workerArgs.push('--base-commit', baseCommit);
     }
     if (timeoutSec && Number.isFinite(timeoutSec) && timeoutSec > 0) {
       workerArgs.push('--timeout', String(timeoutSec));
@@ -814,11 +822,14 @@ function cmdAdvance(options, jobDir) {
     const critiquePrompt = buildCritiquePrompt(originalPrompt, responses, name, includeSelf, jobMode);
     fs.writeFileSync(path.join(memberDir, 'prompt.txt'), critiquePrompt, 'utf8');
 
+    // Use reviewCommand for critique round (no elevated permissions needed)
+    const critiqueCommand = member.reviewCommand || member.command;
+
     atomicWriteJson(path.join(memberDir, 'status.json'), {
       member: name,
       state: 'queued',
       queuedAt: new Date().toISOString(),
-      command: String(member.command),
+      command: String(critiqueCommand),
       round: 'critique',
     });
 
@@ -827,7 +838,7 @@ function cmdAdvance(options, jobDir) {
       '--job-dir', resolvedJobDir,
       '--member', name,
       '--safe-member', safeName,
-      '--command', String(member.command),
+      '--command', String(critiqueCommand),
       '--work-dir', memberDir,
       '--prompt-file', path.join(memberDir, 'prompt.txt'),
     ];
@@ -1190,16 +1201,30 @@ function cmdClean(_options, jobDir) {
 
   // Clean up git worktrees before removing the job directory
   if (jobMeta && jobMeta.mode === 'code' && jobMeta.gitRoot) {
+    const settings = jobMeta.settings || {};
+    const shouldCleanup = settings.cleanupWorktrees !== false;
+    const keepOnError = settings.keepWorktreesOnError === true;
+
     const worktreesDir = path.join(resolvedJobDir, 'worktrees');
-    if (fs.existsSync(worktreesDir)) {
+    if (shouldCleanup && fs.existsSync(worktreesDir)) {
       for (const entry of fs.readdirSync(worktreesDir)) {
+        // If keepWorktreesOnError, check if this member errored
+        if (keepOnError) {
+          const initialDir = path.join(resolvedJobDir, 'rounds', 'initial', entry);
+          const statusPath = path.join(initialDir, 'status.json');
+          const status = readJsonIfExists(statusPath);
+          if (status && status.state !== 'done') {
+            process.stderr.write(`clean: keeping worktree for errored member ${entry}: ${worktreesDir}/${entry}\n`);
+            continue;
+          }
+        }
         const wtPath = path.join(worktreesDir, entry);
         removeWorktree(jobMeta.gitRoot, wtPath);
       }
     }
     // Prune any orphaned worktree references
     try {
-      execSync('git worktree prune', { cwd: jobMeta.gitRoot, stdio: 'ignore' });
+      execFileSync('git', ['worktree', 'prune'], { cwd: jobMeta.gitRoot, stdio: 'ignore' });
     } catch { /* ignore */ }
   }
 

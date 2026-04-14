@@ -96,6 +96,7 @@ function main() {
   const promptFile = options['prompt-file'];
   const mode = options.mode || 'review';
   const worktreeDir = options['worktree-dir'];
+  const baseCommit = options['base-commit'];
 
   if (!jobDir) exitWithError('worker: missing --job-dir');
   if (!member) exitWithError('worker: missing --member');
@@ -123,7 +124,13 @@ function main() {
   const errPath = path.join(memberDir, 'error.txt');
 
   const promptPath = promptFile || path.join(jobDir, 'prompt.txt');
-  const prompt = fs.existsSync(promptPath) ? fs.readFileSync(promptPath, 'utf8') : '';
+  let prompt = fs.existsSync(promptPath) ? fs.readFileSync(promptPath, 'utf8') : '';
+
+  // In code mode, prepend agent briefing
+  if (mode === 'code' && worktreeDir) {
+    const briefing = `You are working in an isolated git worktree. Implement the requested changes directly by editing files. Your changes will be captured automatically via git diff when you're done. Do not describe what you would do — actually do it.\n\n`;
+    prompt = briefing + prompt;
+  }
 
   const tokens = splitCommand(command);
   if (!tokens || tokens.length === 0) {
@@ -241,14 +248,16 @@ function main() {
     const canceled = !timedOut && signal === 'SIGTERM';
     const state = timedOut ? 'timed_out' : canceled ? 'canceled' : code === 0 ? 'done' : 'error';
 
-    // In code mode, collect diff from worktree after agent finishes
+    // In code mode, collect diff from worktree against the pinned base commit
     let hasDiff = false;
     if (mode === 'code' && worktreeDir && (state === 'done' || state === 'error')) {
       try {
-        const { execSync } = require('child_process');
-        // Stage all changes including untracked files, then diff against HEAD
-        execSync('git add -A', { cwd: worktreeDir, stdio: 'ignore' });
-        const diff = execSync('git diff --cached HEAD', { cwd: worktreeDir, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
+        const { execFileSync } = require('child_process');
+        // Stage all changes including untracked files
+        execFileSync('git', ['add', '-A'], { cwd: worktreeDir, stdio: 'ignore' });
+        // Diff against pinned base commit (not HEAD, which may have moved if agent committed)
+        const diffRef = baseCommit || 'HEAD';
+        const diff = execFileSync('git', ['diff', '--cached', diffRef], { cwd: worktreeDir, encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
         const diffPath = path.join(memberDir, 'diff.patch');
         fs.writeFileSync(diffPath, diff, 'utf8');
         hasDiff = diff.trim().length > 0;
