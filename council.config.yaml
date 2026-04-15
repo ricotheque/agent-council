@@ -13,14 +13,14 @@ council:
 
   members:
     - name: claude
-      command: "claude -p --output-format text"
-      code_command: "claude --dangerously-skip-permissions -p --output-format text"
+      command: "claude -p --output-format text --model sonnet"
+      code_command: "claude --dangerously-skip-permissions -p --output-format text --model sonnet"
       emoji: "🧠"
       color: "CYAN"
 
     - name: codex
-      command: "codex exec"
-      code_command: "codex exec --full-auto"
+      command: "codex exec --skip-git-repo-check"
+      code_command: "codex exec --full-auto --skip-git-repo-check"
       emoji: "🤖"
       color: "BLUE"
 
@@ -44,14 +44,14 @@ council:
   # Execution settings
   settings:
     mode: review            # 'review' (text responses) | 'code' (worktree implementations)
-    timeout: 120            # Timeout seconds per agent in review mode (0 to disable)
+    timeout: 600            # Timeout seconds per agent in review mode (0 to disable)
     code_timeout: 600       # Timeout seconds per agent in code mode (agents need more time to explore + implement)
     exclude_chairman_from_members: false  # All models participate as peers
     # synthesize: true       # Force Stage 3 synthesis inside council.sh (requires chairman.command or --chairman codex/gemini)
 
     # Adversarial review: after Round 1 responses, each agent critiques the others
-    adversarial_review: false
-    critique_timeout: 120   # Timeout for the critique round (defaults to timeout if omitted)
+    adversarial_review: true
+    critique_timeout: 600   # Timeout for the critique round (defaults to timeout if omitted)
     critique_include_self: false  # Whether agents see their own Round 1 response in the critique
     cleanup_worktrees: true      # Auto-remove worktrees on clean (code mode)
     keep_worktrees_on_error: false  # Keep worktrees for inspection if agent errors
